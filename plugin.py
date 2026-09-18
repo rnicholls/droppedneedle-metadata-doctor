@@ -5,6 +5,7 @@ v0.1 focuses on safe diagnosis. It does not silently rewrite identity metadata.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from infrastructure.plugins.protocols import PluginRouteResponse
@@ -59,6 +60,157 @@ class MusicBrainzClient:
         return releases
 
 
+async def _apply_exact_release(*, album_id: str, release_mbid: str) -> dict[str, Any]:
+    """Apply an administrator-supplied exact release through native store APIs.
+
+    This deliberately bypasses the explicit-reidentification decision gate.
+    The admin has already supplied the exact MusicBrainz release, so we persist
+    the same manual identity shapes used by DroppedNeedle's native store.
+    """
+    from core.dependencies.cache_providers import get_native_library_store
+    from core.dependencies.repo_providers import get_musicbrainz_identification_repository
+    from core.dependencies.service_providers import _schedule_identified_album_work
+    from models.local_catalog import LocalAlbumExternalIdentity, LocalTrackExternalIdentity
+    from services.native.album_candidate_service import AlbumCandidateService
+    from services.native.identification_revisions import album_input_revisions
+    from services.native.local_album_grouping_service import grouping_track_from_row
+
+    store = get_native_library_store()
+    context = await store.get_album_identification_context(album_id)
+    if context is None:
+        return {"status": 404, "body": {"error": "album_not_found", "message": "Library album not found."}}
+
+    indexed_rows = [
+        row for row in context.get("tracks", [])
+        if row.get("availability") == "indexed"
+    ]
+    if not indexed_rows:
+        return {
+            "status": 400,
+            "body": {"error": "no_indexed_tracks", "message": "The album has no indexed tracks."},
+        }
+
+    candidate_service = AlbumCandidateService(
+        get_musicbrainz_identification_repository()
+    )
+    grouping_tracks = [grouping_track_from_row(row) for row in indexed_rows]
+    candidates = await candidate_service.recall(
+        grouping_tracks,
+        exact_release_mbid=release_mbid,
+        explicit=True,
+    )
+    if not candidates:
+        return {
+            "status": 404,
+            "body": {
+                "error": "release_not_found",
+                "message": "MusicBrainz did not return that release for this album.",
+                "release_mbid": release_mbid,
+            },
+        }
+
+    candidate = candidates[0]
+    release_group_mbid = str(candidate.release_group_mbid or "").strip()
+    candidate_release_mbid = str(candidate.release_mbid or release_mbid).strip()
+    if not release_group_mbid:
+        return {
+            "status": 422,
+            "body": {
+                "error": "release_group_missing",
+                "message": "The selected MusicBrainz release has no release-group ID.",
+                "release_mbid": release_mbid,
+            },
+        }
+
+    local_by_position: dict[tuple[int, int], dict[str, Any]] = {}
+    for row in indexed_rows:
+        position = (int(row.get("disc_number") or 1), int(row.get("track_number") or 0))
+        if position[1] < 1 or position in local_by_position:
+            local_by_position = {}
+            break
+        local_by_position[position] = row
+
+    candidate_by_position: dict[tuple[int, int], Any] = {}
+    for track in candidate.tracks:
+        position = (int(track.disc_number or 1), int(track.position or 0))
+        if (
+            position[1] < 1
+            or not track.recording_mbid
+            or not track.release_track_mbid
+            or position in candidate_by_position
+        ):
+            candidate_by_position = {}
+            break
+        candidate_by_position[position] = track
+
+    if (
+        not local_by_position
+        or not candidate_by_position
+        or set(local_by_position) != set(candidate_by_position)
+    ):
+        return {
+            "status": 400,
+            "body": {
+                "error": "track_mapping_required",
+                "message": (
+                    "The exact release was found, but its disc/track positions "
+                    "do not map one-to-one onto the indexed album. No identity was changed."
+                ),
+                "release_mbid": candidate_release_mbid,
+                "release_group_mbid": release_group_mbid,
+                "local_track_count": len(indexed_rows),
+                "release_track_count": len(candidate.tracks),
+            },
+        }
+
+    now = time.time()
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id=album_id,
+            release_group_mbid=release_group_mbid,
+            release_mbid=candidate_release_mbid,
+            decision_source="manual",
+            selected_at=now,
+        ),
+        expected_album_revision=int(context["album"]["row_revision"]),
+    )
+
+    attached_tracks = 0
+    for position, row in local_by_position.items():
+        provider_track = candidate_by_position[position]
+        await store.attach_track_identity(
+            LocalTrackExternalIdentity(
+                local_track_id=str(row["id"]),
+                recording_mbid=str(provider_track.recording_mbid),
+                release_mbid=candidate_release_mbid,
+                release_track_mbid=str(provider_track.release_track_mbid),
+                medium_position=int(provider_track.disc_number or 1),
+                release_track_position=int(provider_track.position),
+                decision_source="manual",
+                selected_at=now,
+            ),
+            expected_track_revision=int(row.get("identity_row_revision") or 1),
+        )
+        attached_tracks += 1
+
+    await _schedule_identified_album_work(
+        album_id,
+        album_input_revisions(indexed_rows)[2],
+    )
+    return {
+        "status": 200,
+        "body": {
+            "ok": True,
+            "album_id": album_id,
+            "release_mbid": candidate_release_mbid,
+            "release_group_mbid": release_group_mbid,
+            "tracks_updated": attached_tracks,
+            "decision_source": "manual",
+            "message": "Exact MusicBrainz release applied.",
+        },
+    }
+
+
 class MetadataDoctor:
     def __init__(self, context):
         self.ctx = context
@@ -79,7 +231,35 @@ class MetadataDoctor:
         query: dict[str, str],
         body: object,
     ) -> PluginRouteResponse:
-        if method != "POST" or subpath != "diagnose":
+        if method != "POST":
+            return PluginRouteResponse(status=404, body={"error": "not_found"})
+
+        if subpath == "identify-exact":
+            if not isinstance(body, dict):
+                return PluginRouteResponse(
+                    status=400,
+                    body={"error": "invalid_body", "message": "Expected a JSON object."},
+                )
+            album_id = str(body.get("album_id") or "").strip()
+            release_mbid = str(body.get("release_mbid") or "").strip()
+            if not album_id or not release_mbid:
+                return PluginRouteResponse(
+                    status=400,
+                    body={
+                        "error": "missing_fields",
+                        "message": "album_id and release_mbid are required",
+                    },
+                )
+            result = await _apply_exact_release(
+                album_id=album_id,
+                release_mbid=release_mbid,
+            )
+            return PluginRouteResponse(
+                status=int(result["status"]),
+                body=result["body"],
+            )
+
+        if subpath != "diagnose":
             return PluginRouteResponse(status=404, body={"error": "not_found"})
 
         if not isinstance(body, dict):
