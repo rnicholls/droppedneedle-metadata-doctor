@@ -9,8 +9,54 @@ from typing import Any
 
 from infrastructure.plugins.protocols import PluginRouteResponse
 
-from metadata_doctor.musicbrainz import MusicBrainzClient
-from metadata_doctor.scoring import score_release
+from urllib.parse import quote
+
+
+def score_release(candidate: dict[str, Any], tracks: list[dict[str, Any]]) -> dict[str, Any]:
+    expected = int(candidate.get("track_count") or 0)
+    observed = len(tracks)
+    mb_search_score = max(0, min(100, int(candidate.get("score") or 0))) / 100.0
+    track_count_score = 0.0
+    if expected and observed:
+        delta = abs(expected - observed)
+        track_count_score = 1.0 if delta == 0 else 0.65 if delta == 1 else 0.30 if delta <= 3 else 0.0
+    recording_ids = [str(track.get("recording_mbid") or "").strip() for track in tracks if isinstance(track, dict)]
+    embedded_recording_ratio = sum(1 for mbid in recording_ids if mbid) / observed if observed else 0.0
+    total = track_count_score * 0.60 + mb_search_score * 0.25 + embedded_recording_ratio * 0.15
+    warnings = []
+    if expected and observed and expected != observed:
+        warnings.append(f"track_count_mismatch:{observed}_vs_{expected}")
+    if observed and embedded_recording_ratio < 0.5:
+        warnings.append("weak_embedded_recording_evidence")
+    return {"score": round(total, 4), "track_count_score": round(track_count_score, 4), "musicbrainz_search_score": round(mb_search_score, 4), "embedded_recording_ratio": round(embedded_recording_ratio, 4), "warnings": warnings}
+
+
+class MusicBrainzClient:
+    def __init__(self, context):
+        self.ctx = context
+
+    @property
+    def base_url(self) -> str:
+        value = str(self.ctx.settings.get("musicbrainz_base_url") or "").strip()
+        return value.rstrip("/") or "https://musicbrainz.org/ws/2"
+
+    @property
+    def user_agent(self) -> str:
+        value = str(self.ctx.settings.get("user_agent") or "").strip()
+        return value or "DroppedNeedle-Metadata-Doctor/0.2.1"
+
+    async def search_releases(self, *, artist: str, album: str, limit: int = 10) -> list[dict]:
+        query = f'artist:"{artist}" AND release:"{album}"'
+        url = f"{self.base_url}/release/?query={quote(query)}&fmt=json&limit={max(1, min(limit, 25))}"
+        response = await self.ctx.http.get(url, headers={"User-Agent": self.user_agent, "Accept": "application/json"})
+        response.raise_for_status()
+        payload = response.json()
+        releases = []
+        for release in payload.get("releases", []):
+            media = release.get("media") or []
+            track_count = sum(int(m.get("track-count") or 0) for m in media)
+            releases.append({"release_mbid": release.get("id"), "title": release.get("title"), "date": release.get("date"), "country": release.get("country"), "status": release.get("status"), "track_count": track_count or int(release.get("track-count") or 0), "score": int(release.get("score") or 0), "release_group_mbid": (release.get("release-group") or {}).get("id")})
+        return releases
 
 
 class MetadataDoctor:
