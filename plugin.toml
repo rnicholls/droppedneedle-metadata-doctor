@@ -1,0 +1,34 @@
+[plugin]
+name = "droppedneedle-metadata-doctor"
+display_name = "Metadata Doctor"
+version = "0.1.0"
+api_version = 1
+entrypoint = "plugin:MetadataDoctor"
+capabilities = ["metadata_provider", "publisher"]
+description = "Diagnose suspicious album metadata and rank MusicBrainz release candidates without silently overwriting first-party identity."
+author = "rnicholls"
+homepage = "https://github.com/rnicholls/droppedneedle-metadata-doctor"
+
+[[capability]]
+id = "metadata_provider"
+
+[[capability]]
+id = "publisher"
+
+[[settings]]
+key = "musicbrainz_base_url"
+label = "MusicBrainz API URL"
+help = "Usually leave this at the public MusicBrainz API."
+secret = false
+
+[[settings]]
+key = "user_agent"
+label = "MusicBrainz User-Agent"
+help = "A descriptive User-Agent string for MusicBrainz requests."
+secret = false
+
+[[route]]
+path = "diagnose"
+method = "POST"
+auth = "admin"
+rate_limit_per_minute = 30
