@@ -149,7 +149,7 @@ async def _apply_exact_release(*, album_id: str, release_mbid: str) -> dict[str,
         or set(local_by_position) != set(candidate_by_position)
     ):
         return {
-            "status": 409,
+            "status": 400,
             "body": {
                 "error": "track_mapping_required",
                 "message": (
