@@ -189,7 +189,7 @@ async def _apply_exact_release(*, album_id: str, release_mbid: str) -> dict[str,
                 decision_source="manual",
                 selected_at=now,
             ),
-            expected_track_revision=int(row.get("identity_row_revision") or 1),
+            expected_track_revision=int(row.get("row_revision") or 1),
         )
         attached_tracks += 1
 
