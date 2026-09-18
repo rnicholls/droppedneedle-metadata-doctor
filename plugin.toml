@@ -1,11 +1,11 @@
 [plugin]
 name = "droppedneedle-metadata-doctor"
 display_name = "Metadata Doctor"
-version = "0.2.1"
+version = "0.3.0"
 api_version = 1
 entrypoint = "plugin:MetadataDoctor"
 capabilities = ["metadata_provider", "publisher"]
-description = "Diagnose suspicious album metadata and rank MusicBrainz release candidates without silently overwriting first-party identity."
+description = "Diagnose suspicious album metadata and provide an explicit exact-release identity repair path for administrators."
 author = "rnicholls"
 homepage = "https://github.com/rnicholls/droppedneedle-metadata-doctor"
 
@@ -32,6 +32,12 @@ path = "diagnose"
 method = "POST"
 auth = "admin"
 rate_limit_per_minute = 30
+
+[[route]]
+path = "identify-exact"
+method = "POST"
+auth = "admin"
+rate_limit_per_minute = 10
 
 [plugin_ui]
 entry = "ui/dist/panel.js"
